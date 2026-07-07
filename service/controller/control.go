@@ -4,22 +4,42 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/XrayR-project/XrayR/api"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/outbound"
+	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/transport"
+
+	"github.com/XrayR-project/XrayR/api"
+	"github.com/XrayR-project/XrayR/common/limiter"
 )
 
 func (c *Controller) removeInbound(tag string) error {
-	err := c.ihm.RemoveHandler(context.Background(), tag)
+	err := c.ibm.RemoveHandler(context.Background(), tag)
 	return err
 }
 
+// statsOutboundWrapper wraps outbound.Handler to ensure user downlink traffic is counted.
+type statsOutboundWrapper struct {
+	outbound.Handler
+	pm policy.Manager
+	sm stats.Manager
+}
+
+func (w *statsOutboundWrapper) Dispatch(ctx context.Context, link *transport.Link) {
+	// Disable kernel splice to avoid Vision/REALITY bypassing userland stats path
+	if sess := session.InboundFromContext(ctx); sess != nil {
+		sess.CanSpliceCopy = 3
+	}
+	w.Handler.Dispatch(ctx, link)
+}
+
 func (c *Controller) removeOutbound(tag string) error {
-	err := c.ohm.RemoveHandler(context.Background(), tag)
+	err := c.obm.RemoveHandler(context.Background(), tag)
 	return err
 }
 
@@ -32,7 +52,7 @@ func (c *Controller) addInbound(config *core.InboundHandlerConfig) error {
 	if !ok {
 		return fmt.Errorf("not an InboundHandler: %s", err)
 	}
-	if err := c.ihm.AddHandler(context.Background(), handler); err != nil {
+	if err := c.ibm.AddHandler(context.Background(), handler); err != nil {
 		return err
 	}
 	return nil
@@ -47,16 +67,18 @@ func (c *Controller) addOutbound(config *core.OutboundHandlerConfig) error {
 	if !ok {
 		return fmt.Errorf("not an InboundHandler: %s", err)
 	}
-	if err := c.ohm.AddHandler(context.Background(), handler); err != nil {
+	// Wrap outbound handler to ensure downlink stats are always counted (e.g., REALITY/VLESS cases)
+	handler = &statsOutboundWrapper{Handler: handler, pm: c.pm, sm: c.stm}
+	if err := c.obm.AddHandler(context.Background(), handler); err != nil {
 		return err
 	}
 	return nil
 }
 
 func (c *Controller) addUsers(users []*protocol.User, tag string) error {
-	handler, err := c.ihm.GetHandler(context.Background(), tag)
+	handler, err := c.ibm.GetHandler(context.Background(), tag)
 	if err != nil {
-		return fmt.Errorf("No such inbound tag: %s", err)
+		return fmt.Errorf("no such inbound tag: %s", err)
 	}
 	inboundInstance, ok := handler.(proxy.GetInbound)
 	if !ok {
@@ -76,14 +98,23 @@ func (c *Controller) addUsers(users []*protocol.User, tag string) error {
 		if err != nil {
 			return err
 		}
+		// Pre-register per-user traffic counters so core can increment them (downlink/uplink)
+		uName := "user>>>" + mUser.Email + ">>>traffic>>>uplink"
+		dName := "user>>>" + mUser.Email + ">>>traffic>>>downlink"
+		if _, _ = stats.GetOrRegisterCounter(c.stm, uName); true {
+			// no-op
+		}
+		if _, _ = stats.GetOrRegisterCounter(c.stm, dName); true {
+			// no-op
+		}
 	}
 	return nil
 }
 
 func (c *Controller) removeUsers(users []string, tag string) error {
-	handler, err := c.ihm.GetHandler(context.Background(), tag)
+	handler, err := c.ibm.GetHandler(context.Background(), tag)
 	if err != nil {
-		return fmt.Errorf("No such inbound tag: %s", err)
+		return fmt.Errorf("no such inbound tag: %s", err)
 	}
 	inboundInstance, ok := handler.(proxy.GetInbound)
 	if !ok {
@@ -130,8 +161,8 @@ func (c *Controller) resetTraffic(upCounterList *[]stats.Counter, downCounterLis
 	}
 }
 
-func (c *Controller) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo) error {
-	err := c.dispatcher.Limiter.AddInboundLimiter(tag, nodeSpeedLimit, userList)
+func (c *Controller) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalDeviceLimitConfig *limiter.GlobalDeviceLimitConfig) error {
+	err := c.dispatcher.Limiter.AddInboundLimiter(tag, nodeSpeedLimit, userList, globalDeviceLimitConfig)
 	return err
 }
 
